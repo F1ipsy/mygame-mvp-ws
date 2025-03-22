@@ -1,0 +1,4 @@
+node_modules
+game.db
+package-lock.json
+yarn.lock
