@@ -4,6 +4,11 @@ import http from "http";
 import { Server } from "socket.io";
 import axios from "axios";
 import {configDotenv} from "dotenv";
+import { execSync } from 'child_process';
+
+configDotenv();
+
+const app = express();
 
 const corsOptions = {
 	origin: "*",
@@ -11,18 +16,17 @@ const corsOptions = {
 	optionSuccessStatus: 200,
 };
 
-configDotenv();
-
-const app = express();
-
 app.use(express.json());
 app.use(cors(corsOptions));
 
 const server = http.createServer(app);
+
 const io = new Server(server, {
 	cors: {
 		origin: "*",
 	},
+	pingTimeout: 5000,      // клиент должен ответить за 5 сек
+	pingInterval: 2500      // проверять каждые 2.5 сек
 });
 
 let users = [];
@@ -48,12 +52,16 @@ const changeUser = () => {
 io.on("connection", (socket) => {
 	console.log("socket connected", socket.id);
 
+	socket.on("setGame", async (game) => {
+		io.emit("getGameStyle", game.style?.path, game.style?.color_theme);
+	});
+
 	// Подключение к игре
 	socket.on("joinGame", async (user) => {
 
 		socket.data.user = user;
 
-		if (!users.find((el) => el.username === user.username)) {
+		if (user.username && !users.find((el) => el.username === user.username)) {
 			user.status = "connected";
 			users.push(user);
 			socket.emit("myUser", user);
@@ -68,10 +76,9 @@ io.on("connection", (socket) => {
 		const selectedGame = await axios.get(`${process.env.BACKEND_API}/games/current`);
 		socket.emit("getGameStyle", selectedGame.data.style?.path, selectedGame.data.style?.color_theme);
 
-
 		// Возвращает всех подключённых пользователей
 		io.emit("all", users);
-		io.emit("setActiveQuestion", activeQuestion);
+		io.emit("setActiveQuestion", activeQuestion, userQueue, lastAnsweredUser);
 	});
 
 	// Изменение отвечающего пользователя
@@ -81,16 +88,10 @@ io.on("connection", (socket) => {
 		io.emit("newActiveUser", activeUser);
 	});
 
-	socket.on("closeQuestion", () => {
-		activeQuestion = null;
-		userQueue = [];
-		io.emit("setActiveQuestion", activeQuestion);
-	});
-
 	// Добавление очков
 	socket.on("addPoints", ({ activeUser, points }) => {
 		if (activeUser && +points) {
-			users.find((el) => el.username === activeUser.username).points += +points;
+			users.find((el) => el.username === activeUser?.username).points += +points;
 			lastAnsweredUser = users.find((el) => el.username === activeUser.username);
 			userQueue = [];
 		} else {
@@ -104,11 +105,13 @@ io.on("connection", (socket) => {
 	//Переназначение очков
 	socket.on("reassignPoints", ({ lastAnsweredUser, userToReass, points }) => {
 		if (lastAnsweredUser === null) {
-			users.find((el) => el.username === userToReass.username).points += +points;
-		} else {
-			users.find((el) => el.username === userToReass.username).points += +points;
-			users.find((el) => el.username === lastAnsweredUser.username).points -=
+			users.find((el) => el.username === userToReass?.username).points += +points;
+		} else if (userToReass !== null) {
+			users.find((el) => el.username === userToReass?.username).points += +points;
+			users.find((el) => el.username === lastAnsweredUser?.username).points -=
 				+points;
+		} else {
+			users.find((el) => el.username === lastAnsweredUser?.username).points -= +points;
 		}
 
 		// Возвращение обновленного списка игроков
@@ -118,17 +121,22 @@ io.on("connection", (socket) => {
 	// Выбор вопроса
 	socket.on("selectQuestion", (question) => {
 		activeQuestion = question;
+		lastAnsweredUser = null;
+		activeUser = null;
 
 		// Возвращает выбранный вопрос на клиент
-		io.emit("setActiveQuestion", activeQuestion);
+		io.emit("setActiveQuestion", activeQuestion, userQueue, lastAnsweredUser, activeUser);
+	});
+
+	socket.on("closeQuestion", () => {
+		activeQuestion = null;
+		userQueue = [];
+		activeUser = null;
+		io.emit("setActiveQuestion", activeQuestion, userQueue, lastAnsweredUser, activeUser);
 	});
 
 	// Срабатывает когда пользователь жмёт на кнопку ответить
 	socket.on("answerQuestion", (user) => {
-		if (userQueue.find((el) => el.username === user.username)) {
-			return;
-		}
-
 		userQueue.push(user);
 
 		if (!activeUser) {
@@ -142,12 +150,39 @@ io.on("connection", (socket) => {
 		io.emit("getQueue", userQueue);
 	});
 
+	socket.on("endGame", () => {
+		users.map(user => user.points = 0);
+		userQueue = [];
+		activeUser = null;
+		activeQuestion = null;
+		lastAnsweredUser = null;
+		io.emit("endGame")
+	});
+
 	// Отключение от сервера
 	socket.on("disconnecting", () => {
-		users.map((el) => el.username === socket.data.user.username ? el.status = "disconnected" : null)
 		console.log(`Пользователь ${socket.id} отключается`);
+		users.map((el) => el.username === socket.data.user?.username ? el.status = "disconnected" : null);
 		// Возвращает всех подключённых пользователей
+		io.emit("all", users)
+	});
+
+	socket.on("disconnect", () => {
+		console.log(`Сокет ${socket.id} отключился`);
 		io.emit("all", users);
+	});
+
+	socket.on("manualDisconnect", () => {
+		const username = socket.data.user?.username;
+
+		if (username) {
+			users = users.map((el) =>
+				el.username === username ? { ...el, status: "disconnected" } : el
+			);
+
+			io.emit("all", users);
+			console.log(`Пользователь ${username} покинул игру через стрелку назад`);
+		}
 	});
 });
 
@@ -156,6 +191,17 @@ app.get("/", (res) => {
 	res.send("API");
 });
 
-server.listen(3800, () => {
-	console.log("SERVER START");
+const PORT = 3800;
+
+// убиваем процесс, который занят этим портом
+try {
+	const stdout = execSync(`npx kill-port ${PORT}`);
+	console.log(`🔪 Освобожден порт ${PORT}`);
+} catch (e) {
+	console.log(`🟡 Порт ${PORT} и так свободен`);
+}
+
+// твой сервер запускается после этого
+server.listen(PORT, () => {
+	console.log(`✅ Сервер запущен на порту ${PORT}`);
 });
